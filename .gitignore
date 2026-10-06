@@ -1,0 +1,20 @@
+# Python environments and local dependency copies
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+_serial_deps/
+
+# Arduino and other build outputs
+build/
+*.elf
+*.hex
+*.bin
+*.uf2
+
+# Local credentials and OS files
+.env
+.env.*
+!.env.example
+Thumbs.db
+.DS_Store
