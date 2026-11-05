@@ -1,0 +1,931 @@
+// Adafruit ItsyBitsy M0 Express. Serial: 115200 baud, Newline.
+// Manually place the cart near either end and let the pendulum hang still.
+// Commands: 49 baseline | 49 quash | 49 maintain | 49 tune 2.0
+// Negative distance launches the other way. Distance is relative, in mm.
+// Run baseline first to estimate damping. Type stop, or !, to cancel.
+// A completed baseline returns automatically before reporting READY.
+// After a trial, XXX returns to that trial's starting point using step counts.
+// csv reprints the latest trial's time, encoder count and angle for plotting.
+// Data are buffered at 100 Hz and printed as CSV AFTER motion stops.
+
+#include <AccelStepper.h>
+#include <RotaryEncoder.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+// Hardware settings copied from stepper_attempt2. Confirm on the real rig.
+const int STEP_PIN = 9, DIR_PIN = 7, ENC_A = 10, ENC_B = 11;
+const float STEPS_PER_MM = 40.0f, COUNTS_PER_DEGREE = 1.667f;
+const int ANGLE_SIGN = 1;  // +angle must mean the bob leans toward +motor travel.
+const float MAX_SPEED = 7000.0f, MAX_ACCEL = 100000.0f;  // steps/s, steps/s^2
+const float TRACK_MM = 300.0f, END_MARGIN_MM = 5.0f;
+const float PERIOD_S = 0.70f, HOLD_S = 0.70f, CONTROL_S = 10.0f;
+const bool BASELINE_AUTO_RETURN = true;
+const float MAX_TUNE_HZ = 10.0f;  // Maximum requested tune frequency.
+const float RATE_FILTER_S = 0.03f, ENVELOPE_FILTER_S = 0.20f;
+const float RAD_PER_DEG = PI / 180.0f;
+const uint32_t SAMPLE_US = 10000;  // 100 Hz; motor/encoder serviced much faster.
+
+AccelStepper motor(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
+RotaryEncoder encoder(ENC_A, ENC_B, RotaryEncoder::LatchMode::FOUR3);
+
+enum State { IDLE, LAUNCH, HOLD, CONTROL, STOPPING, REPORT, RETURNING };
+enum Mode { BASELINE, QUASH, MAINTAIN, TUNE };
+
+State state = IDLE;
+Mode mode = BASELINE;
+
+// Acceleration feedback [mm/s^2], plus slow cart centering:
+// a = gp*theta + gd*rate - cartKp*(x - reference) - cartKd*v.
+float gp = 0, gd = 0, fixedGp = 0, fixedGd = 0;
+float cartKp = 0, cartKd = 0, cartReference = 0, feedbackDamping = 0;
+const float CART_W2 = 1.0f, CART_DAMPING = 2.0f;
+
+bool manualGains = false, modelReady = false, centeringEnabled = true;
+bool hasTrialOrigin = false, returnInProgress = false;
+uint32_t returnTickUs = 0;
+
+float damping = 0;  // c [1/s] in theta'' + c*theta' + wn^2*theta = -beta*x''.
+float amplitudeStrength = 2.0f;  // Set with "amp 0" for constant-gain trials.
+float naturalW2 = 0, targetW = 0, beta = 0;
+float theta = 0, previousTheta = 0, rate = 0;
+float initialAmplitude = 0, envelope = 0;
+float inwardSign = 1, launchSpeed = 0;
+
+uint32_t startUs, launchEndUs, controlStartUs, stopStartUs;
+uint32_t nextSampleUs, lastSampleUs;
+uint32_t maxGapUs = 0, missedSamples = 0, limitEvents = 0;
+uint32_t belowSinceUs = 0, lastEncoderMotionUs = 0;
+
+long previousCount = 0;
+const char *stopReason = "complete";
+
+// 18 kB, leaving room on the M0's 32 kB RAM. Never print mid-motion.
+struct Sample {
+  uint32_t us;
+  float damping;
+  int16_t steps;
+  int16_t counts;
+};
+
+const int MAX_SAMPLES = 1500;
+Sample samples[MAX_SAMPLES];
+int sampleCount = 0;
+
+// Positive peaks from complete cycles; used for frequency and log decrement.
+const int MAX_PEAKS = 128;  // Room for 10 seconds of peaks at up to 10 Hz.
+float peakTimes[MAX_PEAKS], peakAngles[MAX_PEAKS];
+float peakAngle = 0, peakTime = 0;
+int peakCount = 0, peakPhase = 0;
+
+char command[80];
+int commandLength = 0;
+bool commandOverflow = false, commandStartedBusy = false;
+
+float clampValue(float value, float low, float high) {
+  return fmaxf(low, fminf(value, high));
+}
+
+void updateModel() {
+  float wd = 2.0f * PI / PERIOD_S;
+  naturalW2 = wd * wd + damping * damping / 4.0f;
+  beta = naturalW2 / 9810.0f;
+}
+
+void help() {
+  Serial.println("# Manually position cart at one end; let pendulum hang still.");
+  Serial.println("# distance_mm baseline|quash|maintain|tune [frequency_Hz]");
+  Serial.println("# Examples: 49 baseline; 49 quash; -49 tune 2.0");
+  Serial.print("# Baseline automatic return: ");
+  Serial.println(BASELINE_AUTO_RETURN ? "on" : "off");
+  Serial.println("# XXX returns to the last trial's start. Do not reposition by hand first.");
+  Serial.println("# csv exports the latest trial: time_s,encoder_counts,angle_deg");
+  Serial.println("# amp 0|1; center 0|1; damping c_per_s; gains gp gd; auto; status; stop; !");
+
+  Serial.print("# damping_per_s=");
+  Serial.println(damping, 5);
+
+  Serial.print("# model_ready=");
+  Serial.println(modelReady);
+
+  Serial.println("# READY");
+}
+
+// Match the ideal unfiltered fourth-order model to:
+// (s^2 + desiredDamping*s + targetW^2) * (s^2 + CART_DAMPING*s + CART_W2).
+// Filtering, sampling and motor limits make the measured result approximate.
+void chooseGains(float desiredDamping) {
+  float targetW2 = targetW * targetW;
+
+  cartKp = targetW2 * CART_W2 / naturalW2;
+
+  cartKd = (desiredDamping * CART_W2
+            + CART_DAMPING * targetW2
+            - damping * cartKp) / naturalW2;
+
+  gp = (targetW2 + desiredDamping * CART_DAMPING + CART_W2
+        - naturalW2 - damping * cartKd - cartKp) / beta;
+
+  gd = (desiredDamping + CART_DAMPING - damping - cartKd) / beta;
+
+  if (!centeringEnabled) {
+    cartKp = cartKd = 0;
+    gp = (targetW2 - naturalW2) / beta;
+    gd = (desiredDamping - damping) / beta;
+  }
+
+  if (manualGains) {
+    gp = fixedGp;
+    gd = fixedGd;
+  }
+}
+
+void beginStop(const char *reason, uint32_t now) {
+  if (state == IDLE || state == REPORT || state == STOPPING) return;
+
+  stopReason = reason;
+  stopStartUs = now;
+  state = STOPPING;
+}
+
+void emergencyStop() {
+  if (state == IDLE || state == REPORT) return;
+
+  stopReason = "emergency: step pulses stopped";
+  if (!stopStartUs) stopStartUs = micros();
+
+  hasTrialOrigin = false;  // Abrupt stops can lose physical position.
+  motor.setSpeed(0);       // Immediate pulse cancellation, not a physical brake.
+  state = REPORT;
+}
+
+void readyForCommand() {
+  // Never let input accumulated during motion become a new launch.
+  while (Serial.available()) Serial.read();
+
+  commandLength = 0;
+  commandOverflow = commandStartedBusy = false;
+  state = IDLE;
+  help();
+}
+
+void returnToStart() {
+  // REPORT is allowed so baseline can return without an intermediate READY.
+  if (state != IDLE && state != REPORT) return;
+
+  if (!hasTrialOrigin) {
+    Serial.println("# No valid recorded start. Manually position the cart and run a trial first.");
+    return;
+  }
+
+  float inwardMM = inwardSign * motor.currentPosition() / STEPS_PER_MM;
+
+  if (inwardMM < 0 || inwardMM > TRACK_MM) {
+    hasTrialOrigin = false;
+    Serial.println("# Position estimate is outside the track; return cancelled.");
+    return;
+  }
+
+  if (motor.currentPosition() == 0) {
+    Serial.println("# Already at the recorded start.");
+    return;
+  }
+
+  Serial.println("# Returning to the recorded start. stop or ! cancels.");
+
+  motor.setMaxSpeed(MAX_SPEED);
+  motor.setAcceleration(MAX_ACCEL);
+
+  // Preserve both position counters: zero remains the last trial's origin.
+  returnInProgress = true;
+  returnTickUs = micros();
+  stopStartUs = 0;
+  stopReason = "return complete";
+  state = RETURNING;
+
+  // Re-arm AccelStepper after a cancelled return whose old target was also zero.
+  motor.moveTo(motor.currentPosition());
+  motor.moveTo(0);
+}
+
+void finishReturn() {
+  Serial.print("# Return: ");
+  Serial.println(stopReason);
+
+  Serial.print("# Estimated position from start (mm): ");
+  Serial.println(motor.currentPosition() / STEPS_PER_MM, 3);
+
+  returnInProgress = false;
+  readyForCommand();
+}
+
+void recordSample(uint32_t now, bool feedbackApplied) {
+  if (sampleCount == MAX_SAMPLES) {
+    beginStop("data buffer full", now);
+    return;
+  }
+
+  // NaN marks a sample with no feedback command.
+  samples[sampleCount++] = {
+    now - startUs,
+    feedbackApplied ? feedbackDamping : NAN,
+    (int16_t)motor.currentPosition(),
+    (int16_t)encoder.getPosition()
+  };
+}
+
+// Serial CSV text, not a file on the computer. Copy/save the rows as a .csv.
+// Use stored samples only: returning or changing gains must not alter the trace.
+void printEncoderCSV() {
+  if (state != IDLE) return;
+
+  if (sampleCount == 0) {
+    Serial.println("# No recorded samples. Run a trial first.");
+    return;
+  }
+
+  Serial.println("# BEGIN");
+  Serial.println("time_s,encoder_counts,angle_deg");
+
+  for (int i = 0; i < sampleCount; i++) {
+    const Sample &s = samples[i];
+
+    Serial.print(s.us * 1e-6f, 5);
+    Serial.print(',');
+    Serial.print(s.counts);
+    Serial.print(',');
+    Serial.println(ANGLE_SIGN * s.counts / COUNTS_PER_DEGREE, 3);
+
+    encoder.tick();
+  }
+
+  Serial.println("# END");
+  readyForCommand();
+}
+
+void trackPeak(uint32_t now) {
+  float noise = 1.2f * RAD_PER_DEG;
+
+  if (peakPhase == 0 && theta < -noise) peakPhase = 1;
+
+  if (peakPhase == 1 && theta > noise) {
+    peakPhase = 2;
+    peakAngle = 0;
+  }
+
+  if (peakPhase != 2) return;
+
+  if (theta > peakAngle) {
+    peakAngle = theta;
+    peakTime = (now - controlStartUs) * 1e-6f;
+  }
+
+  if (theta < -noise) {
+    if (peakCount < MAX_PEAKS && peakAngle > 3.0f * RAD_PER_DEG) {
+      peakTimes[peakCount] = peakTime;
+      peakAngles[peakCount++] = peakAngle;
+    }
+
+    peakPhase = 1;
+  }
+}
+
+// Baseline fits ln(positive peak amplitude) = intercept - (c/2)*time.
+bool identifyDamping() {
+  if (peakCount < 5 || missedSamples
+      || strcmp(stopReason, "complete") != 0) return false;
+
+  float sumT = 0, sumY = 0, sumTT = 0, sumTY = 0;
+
+  for (int i = 0; i < peakCount; i++) {
+    float t = peakTimes[i];
+    float y = logf(peakAngles[i]);
+
+    sumT += t;
+    sumY += y;
+    sumTT += t * t;
+    sumTY += t * y;
+  }
+
+  float denominator = peakCount * sumTT - sumT * sumT;
+  if (denominator <= 0) return false;
+
+  float estimate =
+      -2.0f * (peakCount * sumTY - sumT * sumY) / denominator;
+
+  if (!isfinite(estimate) || estimate < -0.05f || estimate > 5.0f) {
+    return false;
+  }
+
+  damping = fmaxf(0.0f, estimate);
+  modelReady = true;
+  updateModel();
+  return true;
+}
+
+void setFeedbackSpeed(float desiredMMs, float dt) {
+  float desiredSteps =
+      clampValue(desiredMMs * STEPS_PER_MM, -MAX_SPEED, MAX_SPEED);
+
+  float currentSpeed = motor.speed();
+  float change = MAX_ACCEL * dt;
+
+  float speed =
+      clampValue(desiredSteps, currentSpeed - change, currentSpeed + change);
+
+  if (state == CONTROL
+      && (fabsf(desiredSteps - desiredMMs * STEPS_PER_MM) > 1
+          || fabsf(speed - desiredSteps) > 1)) {
+    limitEvents++;
+  }
+
+  motor.setSpeed(speed);
+}
+
+void controlTick(uint32_t now) {
+  bool feedbackApplied = false;
+  uint32_t gap = now - lastSampleUs;
+  lastSampleUs = now;
+
+  if (gap > maxGapUs) maxGapUs = gap;
+
+  float dt = gap * 1e-6f;
+
+  previousTheta = theta;
+  theta =
+      ANGLE_SIGN * encoder.getPosition() / COUNTS_PER_DEGREE * RAD_PER_DEG;
+
+  rate += dt / (RATE_FILTER_S + dt)
+          * ((theta - previousTheta) / dt - rate);
+
+  if (gap > 2 * SAMPLE_US) {
+    missedSamples++;
+    beginStop("sampling overrun", now);
+  }
+
+  if (fabsf(theta) > 60 * RAD_PER_DEG) {
+    beginStop("angle limit", now);
+  }
+
+  if (state == HOLD) {
+    initialAmplitude = fmaxf(initialAmplitude, fabsf(theta));
+
+    if ((now - launchEndUs) * 1e-6f >= HOLD_S) {
+      if (initialAmplitude < 3 * RAD_PER_DEG) {
+        beginStop("swing too small to measure", now);
+      } else {
+        controlStartUs = now;
+        envelope = initialAmplitude;
+        state = CONTROL;
+      }
+    }
+  }
+
+  if (state == CONTROL) {
+    trackPeak(now);
+
+    if (fabsf(theta) > 0.1f * initialAmplitude) {
+      belowSinceUs = 0;
+    } else if (!belowSinceUs) {
+      belowSinceUs = now;
+    }
+
+    if ((now - controlStartUs) * 1e-6f >= CONTROL_S) {
+      beginStop("complete", now);
+    }
+  }
+
+  if (state == CONTROL && mode != BASELINE) {
+    float instantaneousAmplitude = hypotf(theta, rate / targetW);
+
+    envelope += dt / (ENVELOPE_FILTER_S + dt)
+                * (instantaneousAmplitude - envelope);
+
+    feedbackDamping =
+        mode == QUASH ? 1.4f * targetW :
+        manualGains ? 0.0f :
+        clampValue(
+          amplitudeStrength * (envelope / initialAmplitude - 1.0f),
+          -2.0f,
+          2.0f
+        );
+
+    chooseGains(feedbackDamping);
+    feedbackApplied = true;
+
+    float positionMM = motor.currentPosition() / STEPS_PER_MM;
+    float speedMMs = motor.speed() / STEPS_PER_MM;
+
+    float acceleration =
+        gp * theta + gd * rate
+        - cartKp * (positionMM - cartReference)
+        - cartKd * speedMMs;
+
+    float boundedAcceleration = clampValue(
+      acceleration,
+      -MAX_ACCEL / STEPS_PER_MM,
+      MAX_ACCEL / STEPS_PER_MM
+    );
+
+    if (boundedAcceleration != acceleration) limitEvents++;
+
+    setFeedbackSpeed(speedMMs + boundedAcceleration * dt, dt);
+
+    float x = inwardSign * motor.currentPosition() / STEPS_PER_MM;
+    float v = inwardSign * motor.speed() / STEPS_PER_MM;
+
+    float braking =
+        v * v / (2 * MAX_ACCEL / STEPS_PER_MM)
+        + fabsf(v) * 0.02f
+        + END_MARGIN_MM;
+
+    if ((v > 0 && x + braking >= TRACK_MM)
+        || (v < 0 && x - braking <= 0)) {
+      beginStop("travel margin reached", now);
+    }
+  } else if (state == STOPPING) {
+    setFeedbackSpeed(0, dt);
+
+    if (motor.speed() == 0) state = REPORT;
+  }
+
+  recordSample(now, feedbackApplied);
+}
+
+const char *phaseName(uint32_t elapsed) {
+  if (stopStartUs && elapsed >= stopStartUs - startUs) return "stop";
+  if (controlStartUs && elapsed >= controlStartUs - startUs) return "control";
+  if (launchEndUs && elapsed >= launchEndUs - startUs) return "hold";
+  return "launch";
+}
+
+void printReport() {
+  bool fitted = mode == BASELINE && identifyDamping();
+
+  float launchSeconds =
+      launchEndUs ? (launchEndUs - startUs) * 1e-6f : 0;
+
+  bool standardLaunch =
+      launchEndUs
+      && fabsf(launchSeconds - PERIOD_S / 2) <= 0.015f
+      && launchSpeed >= 6000
+      && initialAmplitude >= 15 * RAD_PER_DEG;
+
+  Serial.println("# BEGIN");
+
+  Serial.print("# stop_reason=");
+  Serial.println(stopReason);
+
+  Serial.print("# mode=");
+  Serial.println((int)mode);  // 0 baseline, 1 quash, 2 maintain, 3 tune
+
+  Serial.print("# initial_amplitude_deg=");
+  Serial.println(initialAmplitude / RAD_PER_DEG, 3);
+
+  Serial.print("# launch_duration_s=");
+  Serial.println(launchSeconds, 5);
+
+  Serial.print("# standard_launch=");
+  Serial.println(standardLaunch);
+
+  Serial.print("# model_damping_per_s=");
+  Serial.println(damping, 6);
+
+  Serial.print("# baseline_fit_updated=");
+  Serial.println(fitted);
+
+  Serial.print("# requested_frequency_Hz=");
+  Serial.println(targetW / (2 * PI), 5);
+
+  Serial.print("# adaptive_amplitude=");
+  Serial.println(
+    !manualGains && amplitudeStrength > 0 && mode >= MAINTAIN
+  );
+
+  Serial.print("# cart_centering=");
+  Serial.println(centeringEnabled);
+
+  Serial.print("# max_sample_gap_us=");
+  Serial.println(maxGapUs);
+
+  Serial.print("# missed_samples=");
+  Serial.println(missedSamples);
+
+  Serial.print("# limit_events=");
+  Serial.println(limitEvents);
+
+  Serial.print("# model_omega_n_squared=");
+  Serial.println(naturalW2, 6);
+
+  Serial.print("# model_beta_per_mm=");
+  Serial.println(beta, 8);
+
+  Serial.print("# rate_filter_s=");
+  Serial.println(RATE_FILTER_S, 3);
+
+  if (peakCount >= 2) {
+    Serial.print("# measured_frequency_Hz=");
+    Serial.println(
+      (peakCount - 1) / (peakTimes[peakCount - 1] - peakTimes[0]),
+      5
+    );
+
+    float sum = 0;
+
+    for (int i = 0; i < peakCount; i++) {
+      sum += peakAngles[i];
+    }
+
+    Serial.print("# mean_peak_amplitude_deg=");
+    Serial.println(sum / peakCount / RAD_PER_DEG, 3);
+  }
+
+  if (mode == QUASH
+      && !strcmp(stopReason, "complete")
+      && belowSinceUs
+      && stopStartUs - belowSinceUs >= (uint32_t)(PERIOD_S * 1e6f)) {
+    Serial.print("# settling_time_s=");
+    Serial.println((belowSinceUs - controlStartUs) * 1e-6f, 5);
+  }
+
+  Serial.print("# cart_reference_mm_est=");
+  Serial.println(cartReference, 3);
+
+  Serial.println(
+    "time_s,phase,cart_mm_est,angle_deg,"
+    "gp_mm_s2_rad,gd_mm_s_rad,cart_kp_per_s2,cart_kd_per_s,encoder_counts"
+  );
+
+  for (int i = 0; i < sampleCount; i++) {
+    Sample &s = samples[i];
+    const char *phase = phaseName(s.us);
+
+    Serial.print(s.us * 1e-6f, 5);
+    Serial.print(',');
+    Serial.print(phase);
+    Serial.print(',');
+    Serial.print(s.steps / STEPS_PER_MM, 3);
+    Serial.print(',');
+    Serial.print(ANGLE_SIGN * s.counts / COUNTS_PER_DEGREE, 3);
+    Serial.print(',');
+
+    if (isfinite(s.damping)) {
+      chooseGains(s.damping);
+    } else {
+      gp = gd = cartKp = cartKd = 0;
+    }
+
+    Serial.print(gp, 5);
+    Serial.print(',');
+    Serial.print(gd, 5);
+    Serial.print(',');
+    Serial.print(cartKp, 5);
+    Serial.print(',');
+    Serial.print(cartKd, 5);
+    Serial.print(',');
+    Serial.println(s.counts);
+
+    encoder.tick();
+  }
+
+  Serial.println("# END");
+  if (BASELINE_AUTO_RETURN && mode == BASELINE && !strcmp(stopReason, "complete")) {
+    returnToStart();
+    if (returnInProgress) return;
+  }
+  readyForCommand();
+}
+
+bool number(char *token, float &value) {
+  if (!token) return false;
+
+  char *end;
+  value = strtof(token, &end);
+
+  return end != token && *end == '\0' && isfinite(value);
+}
+
+void startTrial(float distance, float frequency) {
+  if (fabsf(distance) <= END_MARGIN_MM
+      || fabsf(distance) >= TRACK_MM - END_MARGIN_MM) {
+    Serial.println(
+      "# Distance must leave 5 mm clearance: 5 < abs(distance) < 295."
+    );
+    return;
+  }
+
+  if (mode != BASELINE && !modelReady) {
+    Serial.println(
+      "# Run a baseline first, or enter known normalized damping with: damping c_per_s"
+    );
+    return;
+  }
+
+  if (micros() - lastEncoderMotionUs < 500000) {
+    Serial.println(
+      "# Let the pendulum hang still for at least 0.5 seconds."
+    );
+    return;
+  }
+
+  updateModel();
+  targetW = mode == TUNE ? 2 * PI * frequency : sqrtf(naturalW2);
+
+  long steps = lroundf(distance * STEPS_PER_MM);
+  float halfPeriod = PERIOD_S / 2;
+
+  float distanceAtMaxSpeed =
+      MAX_SPEED * halfPeriod - MAX_SPEED * MAX_SPEED / MAX_ACCEL;
+
+  launchSpeed = MAX_SPEED;
+
+  if (labs(steps) <= distanceAtMaxSpeed) {
+    launchSpeed = 0.5f * MAX_ACCEL
+        * (halfPeriod
+           - sqrtf(
+             halfPeriod * halfPeriod
+             - 4.0f * labs(steps) / MAX_ACCEL
+           ));
+  }
+
+  Serial.println(
+    "# RUNNING: ! cancels immediately; data follow after stopping."
+  );
+
+  encoder.setPosition(0);
+  motor.setCurrentPosition(0);  // Commanded position only, not physical homing.
+  hasTrialOrigin = true;
+
+  motor.setAcceleration(MAX_ACCEL);
+  motor.setMaxSpeed(launchSpeed);
+
+  inwardSign = distance > 0 ? 1 : -1;
+  cartReference = steps / STEPS_PER_MM;
+
+  theta = previousTheta = rate = initialAmplitude = envelope = gp = gd = 0;
+  sampleCount = peakCount = peakPhase = 0;
+  maxGapUs = missedSamples = limitEvents = belowSinceUs = 0;
+  launchEndUs = controlStartUs = stopStartUs = 0;
+
+  stopReason = "complete";
+  startUs = lastSampleUs = micros();
+  nextSampleUs = startUs + SAMPLE_US;
+
+  state = LAUNCH;
+  recordSample(startUs, false);
+  motor.moveTo(steps);
+}
+
+void handleCommand() {
+  char *first = strtok(command, " \t");
+  char *second = strtok(nullptr, " \t");
+  char *third = strtok(nullptr, " \t");
+  char *extra = strtok(nullptr, " \t");
+
+  if (!first) return;
+
+  if (!strcmp(first, "stop") && !second) {
+    beginStop("user stop", micros());
+    return;
+  }
+
+  if (state != IDLE) return;
+
+  float a, b;
+
+  if ((!strcmp(first, "XXX") || !strcmp(first, "xxx")) && !second) {
+    returnToStart();
+    return;
+  }
+
+  if (!strcmp(first, "csv") && !second) {
+    printEncoderCSV();
+    return;
+  }
+
+  if (!strcmp(first, "status") && !second) {
+    help();
+    return;
+  }
+
+  if (!strcmp(first, "auto") && !second) {
+    manualGains = false;
+    help();
+    return;
+  }
+
+  if (!strcmp(first, "amp")
+      && number(second, a)
+      && !third
+      && (a == 0 || a == 1)) {
+    amplitudeStrength = 2 * a;
+    help();
+    return;
+  }
+
+  if (!strcmp(first, "center")
+      && number(second, a)
+      && !third
+      && (a == 0 || a == 1)) {
+    centeringEnabled = a != 0;
+    help();
+    return;
+  }
+
+  if (!strcmp(first, "damping")
+      && number(second, a)
+      && !third
+      && a >= 0
+      && a <= 5) {
+    damping = a;
+    modelReady = true;
+    updateModel();
+    help();
+    return;
+  }
+
+  if (!strcmp(first, "gains")
+      && number(second, a)
+      && number(third, b)
+      && !extra
+      && fabsf(a) <= 10000
+      && fabsf(b) <= 1000) {
+    fixedGp = a;
+    fixedGd = b;
+    manualGains = true;
+    help();
+    return;
+  }
+
+  if (!number(first, a) || !second || extra) {
+    help();
+    return;
+  }
+
+  if (!strcmp(second, "baseline")) {
+    mode = BASELINE;
+  } else if (!strcmp(second, "quash")) {
+    mode = QUASH;
+  } else if (!strcmp(second, "maintain")) {
+    mode = MAINTAIN;
+  } else if (!strcmp(second, "tune")) {
+    mode = TUNE;
+  } else {
+    help();
+    return;
+  }
+
+  if (mode == TUNE) {
+    if (!number(third, b) || b <= 1 / PERIOD_S || b > MAX_TUNE_HZ) {
+      Serial.print(
+        "# Tune frequency must be above 1.429 Hz and no more than "
+      );
+      Serial.print(MAX_TUNE_HZ, 1);
+      Serial.println(" Hz.");
+      return;
+    }
+  } else {
+    if (third) {
+      help();
+      return;
+    }
+
+    b = 1 / PERIOD_S;
+  }
+
+  startTrial(a, b);
+}
+
+void readCommand() {
+  if (!Serial.available()) return;
+
+  char c = Serial.read();
+
+  if (c == '!') {
+    emergencyStop();
+    commandLength = 0;
+    commandOverflow = true;
+    return;
+  }
+
+  if (c == '\r') return;
+
+  if (c == '\n') {
+    command[commandLength] = '\0';
+
+    if (!commandOverflow && (!commandStartedBusy || state != IDLE)) {
+      handleCommand();
+    } else if (state == IDLE) {
+      Serial.println("# Command discarded; enter a fresh command.");
+    }
+
+    commandLength = 0;
+    commandOverflow = commandStartedBusy = false;
+  } else {
+    if (commandLength == 0) commandStartedBusy = state != IDLE;
+
+    if (commandLength < (int)sizeof(command) - 1) {
+      command[commandLength++] = c;
+    } else {
+      commandOverflow = true;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(ENC_A, INPUT_PULLUP);
+  pinMode(ENC_B, INPUT_PULLUP);
+
+  motor.setMinPulseWidth(3);
+  motor.setMaxSpeed(MAX_SPEED);
+  motor.setAcceleration(MAX_ACCEL);
+
+  updateModel();
+
+  while (!Serial) encoder.tick();
+
+  lastEncoderMotionUs = micros();
+  help();
+}
+
+void loop() {
+  encoder.tick();
+
+  long count = encoder.getPosition();
+
+  if (count != previousCount) {
+    previousCount = count;
+    lastEncoderMotionUs = micros();
+  }
+
+  if (state == LAUNCH || state == RETURNING) {
+    motor.run();
+
+    if (!motor.isRunning()) {
+      if (returnInProgress) {
+        state = REPORT;
+      } else {
+        launchEndUs = micros();
+        state = HOLD;
+        motor.setMaxSpeed(MAX_SPEED);
+      }
+    }
+  } else if (state == CONTROL || state == STOPPING) {
+    motor.runSpeed();
+  }
+
+  readCommand();
+
+  if (state == REPORT) {
+    if (returnInProgress) {
+      finishReturn();
+    } else if (Serial) {
+      printReport();
+    }
+    return;
+  }
+
+  if (state == IDLE) return;
+
+  // SAMD's bool(Serial) delays 10 ms. Never use it while servicing motion.
+  if (!Serial.dtr() || !USBDevice.configured()) {
+    beginStop("USB disconnected", micros());
+  }
+
+  float inwardMM =
+      inwardSign * motor.currentPosition() / STEPS_PER_MM;
+
+  if (inwardMM < 0 || inwardMM > TRACK_MM) {
+    emergencyStop();
+    return;
+  }
+
+  uint32_t now = micros();
+
+  if (returnInProgress) {
+    // Returns are separate moves: never reuse the previous trial's sampling clock.
+    if (state == STOPPING && now - returnTickUs >= SAMPLE_US) {
+      setFeedbackSpeed(0, (now - returnTickUs) * 1e-6f);
+      returnTickUs = now;
+
+      if (motor.speed() == 0) state = REPORT;
+    } else if (state == RETURNING) {
+      returnTickUs = now;
+    }
+    return;
+  }
+
+  if ((int32_t)(now - nextSampleUs) < 0) return;
+
+  nextSampleUs += SAMPLE_US;
+
+  if ((int32_t)(now - nextSampleUs) >= 0) {
+    nextSampleUs = now + SAMPLE_US;
+    missedSamples++;
+  }
+
+  controlTick(now);
+}

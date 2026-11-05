@@ -1,0 +1,165 @@
+"""Interactive Arduino console with automatic CSV capture."""
+
+import argparse
+from datetime import datetime
+from pathlib import Path
+import tempfile
+import threading
+from uuid import uuid4
+
+try:
+    import serial
+except ImportError:
+    raise SystemExit(
+        "Install pyserial first: python -m pip install pyserial"
+    )
+
+
+DEFAULT_PORT = "COM8"
+
+# Change this to select another save folder.
+SAVE_FOLDER = Path(tempfile.gettempdir()) / "PendulumTrials"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "port",
+        nargs="?",
+        help="Arduino port; prompts when omitted",
+    )
+    parser.add_argument("--output", type=Path, default=SAVE_FOLDER)
+    args = parser.parse_args()
+
+    try:
+        port = (
+            args.port or input(f"COM port [{DEFAULT_PORT}]: ")
+        ).strip() or DEFAULT_PORT
+
+        if port.isdigit():
+            port = "COM" + port
+        elif port.lower().startswith("com"):
+            port = port.upper()
+
+        args.output = args.output.expanduser().resolve()
+        args.output.mkdir(parents=True, exist_ok=True)
+
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled.")
+        return
+
+    except OSError as error:
+        print(f"Cannot create the save folder: {error}")
+        return
+
+    try:
+        connection = serial.Serial(
+            port,
+            115200,
+            timeout=0.25,
+            write_timeout=1,
+        )
+    except (serial.SerialException, OSError) as error:
+        print(f"Cannot open {port}: {error}")
+        print(
+            "Check the port and close Arduino Serial Monitor, "
+            "then run this file again."
+        )
+        return
+
+    stopped = threading.Event()
+
+    with connection:
+        def receive():
+            trial = None
+            pending = b""
+
+            try:
+                while not stopped.is_set():
+                    pending += connection.readline()
+
+                    if b"\n" not in pending:
+                        continue
+
+                    raw_line, _, pending = pending.partition(b"\n")
+                    line = (raw_line + b"\n").decode(
+                        "utf-8", errors="replace"
+                    )
+
+                    if line.strip() == "# BEGIN":
+                        if trial:
+                            trial.close()
+
+                        filename = (
+                            f"trial_{datetime.now():%Y%m%d_%H%M%S}_"
+                            f"{uuid4().hex[:8]}.csv"
+                        )
+                        path = args.output / filename
+                        trial = path.open(
+                            "x", encoding="utf-8", newline=""
+                        )
+
+                    if trial:
+                        trial.write(line)
+
+                    if line.startswith("#"):
+                        print(line.rstrip(), flush=True)
+
+                    if line.strip() == "# END" and trial:
+                        trial.close()
+                        trial = None
+                        print(f"Saved {path}", flush=True)
+
+            except (serial.SerialException, OSError) as error:
+                print(
+                    f"Serial capture stopped: {error}",
+                    flush=True,
+                )
+                stopped.set()
+
+            finally:
+                if trial:
+                    trial.close()
+
+        receiver = threading.Thread(target=receive, daemon=True)
+        receiver.start()
+
+        print(f"Connected to {port}.")
+        print(f"CSV folder: {args.output}")
+        print(
+            "Commands: 49 baseline | 49 quash | 49 maintain | "
+            "49 tune 2.0 | XXX | csv"
+        )
+        print("Enter commands below. Ctrl+C sends ! and exits.")
+
+        try:
+            while not stopped.is_set():
+                command = input("> ")
+
+                try:
+                    connection.write(
+                        (command + "\n").encode("ascii")
+                    )
+                except UnicodeEncodeError:
+                    print(
+                        "Use plain ASCII commands, "
+                        "for example: 49 baseline"
+                    )
+
+        except (KeyboardInterrupt, EOFError):
+            if connection.is_open:
+                try:
+                    connection.write(b"!\n")
+                except (serial.SerialException, OSError):
+                    pass
+
+        except (serial.SerialException, OSError) as error:
+            print(f"Serial command failed: {error}")
+
+        finally:
+            stopped.set()
+            receiver.join(timeout=1)
+
+
+if __name__ == "__main__":
+    main()

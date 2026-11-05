@@ -1,0 +1,27 @@
+# Milestone 2 recording workflow
+
+Run `csv_code_MK2.py`, press Enter for COM8, and keep this console open between trials. Close Arduino Serial Monitor first. Moving these files does not change the COM port or data format. The Arduino sketch remains inside its matching `MS2_MK1` folder.
+
+Saving starts OFF. Enter each command separately, and wait for `# READY` between board operations:
+
+1. `49 baseline` — run the calibration without saving a CSV. Check `baseline_fit_updated=1` and `model_ready=1` afterward.
+2. `XXX` — return to the recorded start; let the pendulum settle.
+3. `track next` — arm one recording in Python. `start csv tracking` is an alias.
+4. `49 quash` — the next accepted trial is selected and its full report is saved.
+5. After the report, use `XXX`, then `track next`, then another trial such as `49 tune 2.0`.
+
+The console supports as many commands/trials as needed. Commands entered while the board is busy are rejected locally rather than queued; `stop` and `!` remain available. `track next` can arm a future run while another run is active without selecting the active run. A trial rejected by the Arduino does not consume the arm. `track off` cancels future/pending tracking; a trial already acknowledged by `# RUNNING` continues to be saved. `tracking` displays the current state; `help` lists commands. `XXX`, `status`, settings commands and `csv` replay do not consume the arm.
+
+Files go to `PendulumTrials` in the Windows temporary folder, whose full path is printed at startup. Change `SAVE_FOLDER` or use `--output` to choose another folder. Each selected trial gets a unique filename containing its mode and timestamp. Copy keeper files elsewhere, together with their JSON sidecars.
+
+The CSV is a standard header-first file with these columns:
+
+```text
+time_s,phase,cart_mm_est,angle_deg,gp_mm_s2_rad,gd_mm_s_rad,cart_kp_per_s2,cart_kd_per_s,encoder_counts
+```
+
+`time_s` is the actual Arduino sample time relative to the trial's initial move, including launch, hold, control and braking. It is not the time Python receives the report. `encoder_counts` is the measured pendulum encoder position relative to trial zero; `angle_deg` is its converted angle. `cart_mm_est` is estimated motor/cart displacement from commanded steps, not independent cart feedback.
+
+Python writes an initially empty `.partial.csv` when a tracked trial is accepted. Data arrive after the Arduino stops, as before. A valid `# END` finalizes the file as `.csv`; interrupted or malformed reports retain `.partial.csv`. The JSON sidecar stores the command, port, units, Arduino metadata and completion flags. `report_complete` means the complete data report arrived; `trial_completed_normally`/`trial_success` mean the firmware reported `stop_reason=complete`. Neither flag proves that quash, amplitude or frequency goals were achieved.
+
+Read completed files directly with `csv.DictReader` or `pandas.read_csv`; no comment-skipping option is required. The JSON contains the reported settings and timing diagnostics separately. No Arduino motion or feedback change is required for this recording feature.

@@ -1,0 +1,292 @@
+"""Arduino console: calibrate freely, then use 'track next' to save one trial."""
+
+import argparse
+import csv
+from datetime import datetime
+import json
+import math
+from pathlib import Path
+import tempfile
+import threading
+from uuid import uuid4
+
+try:
+    import serial
+except ImportError:
+    raise SystemExit("Install pyserial first: python -m pip install pyserial")
+
+DEFAULT_PORT = "COM8"
+SAVE_FOLDER = Path(tempfile.gettempdir()) / "PendulumTrials"
+FIELDS = {
+    "time_s", "phase", "cart_mm_est", "angle_deg", "encoder_counts",
+    "gp_mm_s2_rad", "gd_mm_s_rad", "cart_kp_per_s2", "cart_kd_per_s",
+}
+REJECTIONS = (
+    "Distance must", "Run a baseline first", "Let the pendulum hang still",
+    "Tune frequency must", "No valid recorded start", "Position estimate is outside",
+    "Already at the recorded start", "No recorded samples", "Command discarded",
+)
+
+
+class CaptureSession:
+    """Shared console/receiver state. A selected trial cannot change mid-run."""
+
+    def __init__(self, output, port, emit=print):
+        self.output, self.port, self.emit = Path(output), port, emit
+        self.output.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.Lock()
+        self.armed, self.busy = False, True  # Wait for the initial firmware READY.
+        self.pending = self.current = self.capture = None
+        self.report_open = False
+        self.arm_version = 0
+
+    def submit(self, command, write):
+        command = command.strip()
+        if not command:
+            return
+        local = " ".join(command.lower().split())
+        with self.lock:
+            if local in ("track next", "start csv tracking"):
+                if not self.armed:
+                    self.arm_version += 1
+                self.armed = True
+                self.emit("Tracking armed: the next newly accepted trial will be saved.")
+                return
+            if local == "track off":
+                self.armed = False
+                if self.pending:
+                    self.pending["selected"] = False
+                self.emit("Future tracking cancelled; an already selected trial is unchanged.")
+                return
+            if local == "tracking":
+                saving = bool(self.current and self.current["selected"])
+                self.emit(f"Tracking armed={self.armed}; selected run={saving}; board busy={self.busy}")
+                return
+            if local in ("help", "?"):
+                self.emit("Local: track next | start csv tracking | track off | tracking")
+                self.emit("Arduino: 49 baseline | XXX | 49 quash | 49 maintain | 49 tune 2.0 | csv | status | stop | !")
+                return
+            if command not in ("stop", "!"):
+                if self.busy:
+                    self.emit("Board busy: wait for # READY. Commands are not queued.")
+                    return
+                parts = command.split()
+                if len(parts) >= 2 and parts[1] in ("baseline", "quash", "maintain", "tune"):
+                    try:
+                        expected = 3 if parts[1] == "tune" else 2
+                        if len(parts) != expected or not all(math.isfinite(float(x)) for x in (parts[0], *parts[2:])):
+                            raise ValueError
+                    except ValueError:
+                        self.emit("Use distance_mm mode, or distance_mm tune frequency_Hz.")
+                        return
+                    self.pending = {
+                        "command": command, "mode": parts[1], "selected": self.armed,
+                        "arm_version": self.arm_version,
+                    }
+                self.busy = True
+        # Publish pending state before writing; an acknowledgement can arrive immediately.
+        try:
+            write((command + "\n").encode("ascii"))
+        except UnicodeEncodeError:
+            with self.lock:
+                self.pending, self.busy = None, False
+            self.emit("Use plain ASCII Arduino commands.")
+        except (serial.SerialException, OSError):
+            with self.lock:
+                self.pending, self.busy = None, False
+            raise
+
+    def _new_capture(self):
+        name = f"{datetime.now():%Y%m%d_%H%M%S}_{self.current['mode']}_{uuid4().hex[:8]}"
+        partial = self.output / (name + ".partial.csv")
+        self.capture = {
+            "partial": partial, "final": self.output / (name + ".csv"),
+            "json": self.output / (name + ".json"),
+            "file": partial.open("x", encoding="utf-8", newline=""),
+            "command": self.current["command"], "mode": self.current["mode"],
+            "metadata": {}, "header": None, "rows": 0, "last_time": None,
+            "error": None,
+        }
+        # Exclusive creation protects existing files; later updates are to this owned sidecar.
+        with self.capture["json"].open("x", encoding="utf-8") as stream:
+            json.dump(self._details(False, "Waiting for the Arduino report"), stream, indent=2)
+        self.emit(f"Tracking {self.current['command']}; writing {partial}")
+
+    def _details(self, complete, error):
+        capture = self.capture
+        return {
+            "command": capture["command"], "mode": capture["mode"], "port": self.port,
+            "report_complete": complete,
+            "trial_success": complete and capture["metadata"].get("stop_reason") == "complete",
+            "trial_completed_normally": complete and capture["metadata"].get("stop_reason") == "complete",
+            "success_definition": "Firmware completed its sequence; not proof that a control goal was achieved.",
+            "rows": capture["rows"], "error": error,
+            "metadata": capture["metadata"],
+            "units": {"time_s": "seconds since trial start", "encoder_counts": "pendulum counts relative to trial zero",
+                      "angle_deg": "degrees", "cart_mm_est": "millimetres from commanded motor steps"},
+            "motor_position_is_estimate": True,
+        }
+
+    def _finish_capture(self, complete=False, error=None):
+        if not self.capture:
+            return
+        capture = self.capture
+        complete = bool(complete and capture["header"] and capture["rows"] and not capture["error"])
+        error = capture["error"] or error
+        if not complete and not error:
+            error = "Report had no complete full-data CSV"
+        capture["file"].close()
+        path = capture["partial"]
+        if complete:
+            try:
+                if capture["final"].exists():
+                    raise FileExistsError("The final CSV already exists")
+                path = capture["partial"].rename(capture["final"])
+            except OSError as failure:
+                complete, error = False, str(failure)
+        with capture["json"].open("w", encoding="utf-8") as stream:
+            json.dump(self._details(complete, error), stream, indent=2)
+        self.emit(f"{'Saved' if complete else 'Kept incomplete capture'}: {path}")
+        self.capture = None
+
+    def receive_line(self, line):
+        original = line.rstrip("\r\n")
+        text = original.strip()
+        with self.lock:
+            if text.startswith("#"):
+                self.emit(text)
+                message = text[1:].strip()
+                if message.startswith("RUNNING"):
+                    self._finish_capture(error="A new trial started before the previous report finished")
+                    self.current = self.pending or {"command": "unknown", "mode": "unknown", "selected": False}
+                    self.pending, self.busy = None, True
+                    if self.current["selected"]:
+                        if self.current["arm_version"] == self.arm_version:
+                            self.armed = False
+                        self._new_capture()
+                elif message == "BEGIN":
+                    if self.report_open:
+                        self._finish_capture(error="New report arrived before END")
+                        self.current = None
+                    self.report_open = True
+                elif message == "END":
+                    self._finish_capture(complete=self.report_open,
+                                         error=None if self.report_open else "END arrived before BEGIN")
+                    self.report_open, self.current = False, None
+                elif message == "READY":
+                    if self.current:
+                        self._finish_capture(error="READY arrived before the report finished")
+                        self.current, self.report_open = None, False
+                    # A delayed startup/status READY must not cancel a submitted trial.
+                    if self.pending is None:
+                        self.busy = False
+                elif message.startswith(REJECTIONS):
+                    if self.pending is not None:
+                        self.emit("Trial rejected; tracking remains armed if previously enabled.")
+                    self.pending, self.busy = None, False
+                elif self.report_open and self.capture and "=" in message:
+                    key, value = message.split("=", 1)
+                    try:
+                        value = json.loads(value)
+                    except (ValueError, TypeError):
+                        pass
+                    self.capture["metadata"][key.strip()] = value
+                return
+
+            if not text or not self.report_open or not self.capture:
+                return
+            capture = self.capture
+            try:
+                fields = next(csv.reader([original]))
+            except csv.Error as error:
+                capture["error"] = str(error)
+                return
+            if capture["header"] is None:
+                if not FIELDS.issubset(fields):
+                    capture["error"] = "Expected the full trial CSV including estimated cart position and gains"
+                    return
+                capture["header"] = fields
+            else:
+                try:
+                    if len(fields) != len(capture["header"]):
+                        raise ValueError("CSV column count changed")
+                    time_s = float(fields[capture["header"].index("time_s")])
+                    if not math.isfinite(time_s) or time_s < 0 or (capture["last_time"] is not None and time_s <= capture["last_time"]):
+                        raise ValueError("Invalid or non-increasing firmware timestamp")
+                    capture["last_time"] = time_s
+                except (ValueError, IndexError) as error:
+                    capture["error"] = str(error)
+                    return
+                capture["rows"] += 1
+            if not capture["error"]:
+                capture["file"].write(original + "\n")
+
+    def close(self):
+        with self.lock:
+            self._finish_capture(error="Connection closed before a complete report")
+            self.pending = self.current = None
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("port", nargs="?", help="Arduino port; prompts when omitted")
+    parser.add_argument("--output", type=Path, default=SAVE_FOLDER)
+    args = parser.parse_args()
+    try:
+        port = (args.port or input(f"COM port [{DEFAULT_PORT}]: ")).strip() or DEFAULT_PORT
+        port = "COM" + port if port.isdigit() else port.upper() if port.lower().startswith("com") else port
+        args.output = args.output.expanduser().resolve()
+        args.output.mkdir(parents=True, exist_ok=True)
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled.")
+        return
+    except OSError as error:
+        print(f"Cannot create the save folder: {error}")
+        return
+    try:
+        connection = serial.Serial(port, 115200, timeout=0.25, write_timeout=1)
+    except (serial.SerialException, OSError) as error:
+        print(f"Cannot open {port}: {error}\nClose Arduino Serial Monitor and check the port.")
+        return
+    stopped = threading.Event()
+    session = CaptureSession(args.output, port)
+    with connection:
+        def receive():
+            pending = b""
+            try:
+                while not stopped.is_set():
+                    pending += connection.readline()
+                    while b"\n" in pending:
+                        line, _, pending = pending.partition(b"\n")
+                        session.receive_line(line.decode("utf-8", errors="replace"))
+            except (serial.SerialException, OSError) as error:
+                print(f"Serial capture stopped: {error}. Press Enter to exit.", flush=True)
+                stopped.set()
+            finally:
+                session.close()
+        receiver = threading.Thread(target=receive, daemon=True)
+        receiver.start()
+        print(f"Connected to {port}. CSV folder: {args.output}")
+        print("Saving is OFF. Use track next before a trial you want to save; help lists commands.")
+        print("Wait for # READY. Ctrl+C sends ! and exits.")
+        try:
+            connection.write(b"status\n")  # Read readiness/calibration state; never starts motion.
+            while not stopped.is_set():
+                command = input("> ")
+                if not stopped.is_set():
+                    session.submit(command, connection.write)
+        except (KeyboardInterrupt, EOFError):
+            try:
+                connection.write(b"!\n")
+            except (serial.SerialException, OSError):
+                pass
+        except (serial.SerialException, OSError) as error:
+            print(f"Serial command failed: {error}")
+        finally:
+            stopped.set()
+            receiver.join(timeout=1)
+            session.close()
+
+
+if __name__ == "__main__":
+    main()

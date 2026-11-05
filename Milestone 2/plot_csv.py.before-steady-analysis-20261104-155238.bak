@@ -1,0 +1,220 @@
+"""Plot a Milestone 2 CSV and estimate oscillation period from angle peaks.
+
+Run this file in your Python editor, or from a terminal:
+    python plot_csv.py
+    python plot_csv.py another_trial.csv
+    python plot_csv.py another_trial.csv --start 1 --end 5
+    python plot_csv.py another_trial.csv --phase hold
+
+Requires: numpy, scipy, matplotlib
+Install missing packages in your Python environment with:
+    python -m pip install numpy scipy matplotlib
+
+Frequency comes from successive upper angle peaks (one full cycle apart).
+It describes the selected recording; it does not automatically measure the
+pendulum's natural frequency when the cart is moving or control is active.
+"""
+
+from pathlib import Path
+import argparse
+import csv
+
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.signal import find_peaks
+
+
+# -------------------- SETTINGS YOU CAN CHANGE --------------------
+# A filename looks beside this script. An absolute path also works.
+# Set CSV_FILE = "" to be asked for a path each time you run the file.
+CSV_FILE = "150_tune_3.csv"
+START_TIME_S = 0.0
+END_TIME_S = None                 # None means through the end of the file.
+PHASE = "all"                     # all, launch, hold, control, etc.
+PEAK_PROMINENCE_DEG = 1.2          # Raise this to reject small/noisy peaks.
+MIN_PEAK_DISTANCE_S = 0.20         # Lower this for oscillations above 5 Hz.
+SAVE_RESULTS = True               # Save both plots and the peak/period table.
+# -----------------------------------------------------------------
+
+
+def get_options():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("csv_file", nargs="?", default=CSV_FILE,
+                        help="CSV filename beside this script, or a full path")
+    parser.add_argument("--start", type=float, default=START_TIME_S,
+                        help="Start of peak analysis in seconds")
+    parser.add_argument("--end", type=float, default=END_TIME_S,
+                        help="End of peak analysis in seconds")
+    parser.add_argument("--phase", default=PHASE,
+                        help="Analyze one phase, or all (default)")
+    parser.add_argument("--prominence", type=float, default=PEAK_PROMINENCE_DEG,
+                        help="Minimum peak prominence in degrees")
+    parser.add_argument("--min-distance", type=float, default=MIN_PEAK_DISTANCE_S,
+                        help="Minimum time between retained peaks in seconds")
+    parser.add_argument("--output", type=Path,
+                        help="Folder for saved results (default: beside the CSV)")
+    parser.add_argument("--no-save", action="store_true", help="Do not save results")
+    parser.add_argument("--no-show", action="store_true", help="Save plots without opening windows")
+    args = parser.parse_args()
+    if not np.isfinite(args.start) or args.start < 0:
+        parser.error("--start must be finite and nonnegative")
+    if args.end is not None and (not np.isfinite(args.end) or args.end <= args.start):
+        parser.error("--end must be finite and greater than --start")
+    if not np.isfinite(args.prominence) or args.prominence <= 0:
+        parser.error("--prominence must be finite and positive")
+    if not np.isfinite(args.min_distance) or args.min_distance < 0:
+        parser.error("--min-distance must be finite and nonnegative")
+    return args
+
+
+def load_csv(path):
+    """Read just the required columns; extra logger columns are accepted."""
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        columns = reader.fieldnames or []
+        missing = {"time_s", "angle_deg"} - set(columns)
+        if missing:
+            raise ValueError("Missing required CSV columns: " + ", ".join(sorted(missing)))
+        rows = list(reader)
+    if len(rows) < 3:
+        raise ValueError("The CSV needs at least three data rows.")
+    time = np.array([float(row["time_s"]) for row in rows])
+    angle = np.array([float(row["angle_deg"]) for row in rows])
+    phase = np.array([row.get("phase", "") for row in rows])
+    cart = None
+    if "cart_mm_est" in columns:
+        cart = np.array([float(row["cart_mm_est"]) for row in rows])
+    if not np.all(np.isfinite(time)) or np.any(np.diff(time) <= 0):
+        raise ValueError("time_s must contain finite, strictly increasing sample times.")
+    # Keep NaN angles in place so gaps do not become false peak intervals.
+    return time, angle, cart, phase
+
+
+def detect_peaks(time, angle, selected, prominence, min_distance):
+    """Analyze contiguous valid segments without measuring periods across gaps."""
+    indices = np.flatnonzero(selected & np.isfinite(angle))
+    segments = np.split(indices, np.flatnonzero(np.diff(indices) > 1) + 1)
+    detected = []
+    periods = []
+    rows = []
+    for segment in segments:
+        if len(segment) < 3:
+            continue
+        local, properties = find_peaks(angle[segment], prominence=prominence,
+                                       plateau_size=True)
+        candidates = segment[local]
+        # Use real timestamps for spacing; no constant sampling rate is assumed.
+        kept = []
+        for candidate in candidates[np.argsort(-properties["prominences"], kind="stable")]:
+            if all(abs(time[candidate] - time[other]) >= min_distance for other in kept):
+                kept.append(int(candidate))
+        kept.sort()
+        detected.extend(kept)
+        for number, sample in enumerate(kept):
+            period = time[sample] - time[kept[number - 1]] if number else None
+            if period is not None:
+                periods.append(period)
+            rows.append((time[sample], angle[sample], period,
+                         1.0 / period if period is not None else None))
+    return np.array(detected, dtype=int), np.array(periods), rows
+
+
+def main():
+    args = get_options()
+    raw_path = args.csv_file or input("Paste the CSV path or filename: ")
+    path = Path(raw_path.strip().strip('"').strip("'")).expanduser()
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    if not path.is_file():
+        raise ValueError(f"CSV not found: {path}\nChange CSV_FILE at the top, or pass a CSV path.")
+    time, angle, cart, phase = load_csv(path)
+    selected = time >= args.start
+    if args.end is not None:
+        selected &= time <= args.end
+    if args.phase != "all":
+        if args.phase not in phase:
+            available = ", ".join(dict.fromkeys(phase)) or "no phase column"
+            raise ValueError(f"Phase {args.phase!r} is unavailable. Available: {available}")
+        selected &= phase == args.phase
+    if np.count_nonzero(selected & np.isfinite(angle)) < 3:
+        raise ValueError("Fewer than three valid angle samples in the selected phase/time range.")
+
+    peaks, periods, peak_rows = detect_peaks(time, angle, selected,
+                                           args.prominence, args.min_distance)
+    report = [f"CSV: {path.name}",
+              f"Samples: {len(time)} | duration: {time[-1] - time[0]:.3f} s",
+              f"Median sample interval: {1000 * np.median(np.diff(time)):.3f} ms",
+              f"Analysis: {time[selected][0]:.3f} to {time[selected][-1]:.3f} s | phase: {args.phase}",
+              f"Upper angle peaks: {len(peaks)} | prominence: {args.prominence:g} deg | minimum spacing: {args.min_distance:g} s"]
+    if len(periods):
+        period = float(np.median(periods))
+        frequency = 1.0 / period
+        result = f"Median period: {period:.3f} s | frequency: {frequency:.3f} Hz"
+        report.extend(["Individual periods (s): " + ", ".join(f"{value:.4f}" for value in periods),
+                       result,
+                       f"Period standard deviation: {np.std(periods):.4f} s ({len(periods)} intervals)",
+                       f"Peak times (s): " + ", ".join(f"{value:.4f}" for value in time[peaks])])
+        if len(periods) < 3:
+            report.append("Only a few complete cycles are available; treat this as a short-record estimate.")
+    else:
+        result = "Frequency unavailable: fewer than two usable upper peaks"
+        report.append(result + ". Try a longer window or adjust peak settings.")
+    report.append("This is the observed oscillation frequency in the selected data; moving-cart/control phases can change it.")
+
+    angle_fig, angle_ax = plt.subplots(figsize=(11, 5.5), constrained_layout=True)
+    angle_ax.plot(time, angle, color="tab:blue", linewidth=1.4, label="Pendulum angle")
+    angle_ax.plot(time[peaks], angle[peaks], "rx", markersize=9,
+                  markeredgewidth=2, label="Upper peaks used for period")
+    angle_ax.set(xlabel="Time (s)", ylabel="Pendulum angle (degrees)",
+                 title=f"Pendulum angle - {path.name}\n{result}")
+    angle_ax.axhline(0, color="gray", linewidth=0.6)
+
+    cart_fig = None
+    if cart is not None:
+        cart_fig, cart_ax = plt.subplots(figsize=(11, 5.5), constrained_layout=True)
+        cart_ax.plot(time, cart, color="tab:orange", linewidth=1.4,
+                     label="Cart position estimated from commanded steps")
+        cart_ax.set(xlabel="Time (s)", ylabel="Estimated cart position (mm)",
+                    title=f"Estimated cart position - {path.name}")
+    else:
+        report.append("No cart_mm_est column: cart plot skipped.")
+
+    axes = [angle_ax] + ([cart_ax] if cart_fig is not None else [])
+    for ax in axes:
+        if not np.all(selected):
+            # Shade each selected segment, keeping separate phase blocks separate.
+            indices = np.flatnonzero(selected)
+            segments = np.split(indices, np.flatnonzero(np.diff(indices) > 1) + 1)
+            for number, segment in enumerate(segments):
+                ax.axvspan(time[segment[0]], time[segment[-1]], color="tab:green",
+                           alpha=0.12, label="Peak analysis window" if number == 0 else None)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best")
+
+    print("\n".join(report))
+    if SAVE_RESULTS and not args.no_save:
+        output = args.output or path.parent / (path.stem + "_analysis")
+        output.mkdir(parents=True, exist_ok=True)
+        angle_fig.savefig(output / "pendulum_angle.png", dpi=180)
+        if cart_fig is not None:
+            cart_fig.savefig(output / "cart_position.png", dpi=180)
+        with (output / "peaks_and_periods.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["peak_time_s", "peak_angle_deg", "period_since_previous_peak_s", "frequency_Hz"])
+            writer.writerows(peak_rows)
+        (output / "summary.txt").write_text("\n".join(report) + "\n", encoding="utf-8")
+        print(f"Saved plots, peak table, and summary to: {output.resolve()}")
+    if args.no_show:
+        plt.close(angle_fig)
+        if cart_fig is not None:
+            plt.close(cart_fig)
+    else:
+        plt.show()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError) as error:
+        raise SystemExit(str(error))
