@@ -12,6 +12,7 @@ info = sprintf('1–3 bolts  ·  50–70 mm  ·  5 s free swing  ·  Assumed c =
 uilabel(page,'Text',info,'Tag','batchInfo');
 tabs = uitabgroup(page);
 plotTab = uitab(tabs,'Title','Coefficient plots');
+distanceTab = uitab(tabs,'Title','Distance by configuration');
 tableTab = uitab(tabs,'Title','Run table (63)');
 plotGrid = uigridlayout(plotTab,[3 3]);
 plotGrid.RowHeight = {32,'1x',36};
@@ -29,14 +30,43 @@ for k = 1:3
 end
 caption = uilabel(plotGrid,'Text','','FontSize',12,'WordWrap','on');
 caption.Layout.Row = 3; caption.Layout.Column = [1 3];
+distanceGrid = uigridlayout(distanceTab,[2 3]);
+distanceGrid.RowHeight = {'1x',32};
+boltNames = {'1 centre','2 outer','3 all'};
+panelTitles = {'1 bolt (centre)','2 bolts (outer)','3 bolts (all)'};
+% Share the b scale across panels. On each right axis the same height reads
+% as c = Ip*b for that configuration. Keep zero in view for flat sweeps.
+bLimits = fitLimits(runs.fit_b_s_inv);
+for bolt = 1:3
+    cases = sortrows(runs(runs.bolt_count==bolt,:),'distance_mm');
+    ax = uiaxes(distanceGrid,'Tag',sprintf('distanceAxes%d',bolt));
+    ax.Layout.Row = 1; ax.Layout.Column = bolt;
+    yyaxis(ax,'left');
+    curve = plot(ax,cases.distance_mm,cases.fit_b_s_inv,'-o', ...
+        'Color',[.14 .47 .72],'LineWidth',1.4,'MarkerSize',4);
+    curve.DataTipTemplate.DataTipRows = [dataTipTextRow('Distance (mm)',cases.distance_mm), ...
+        dataTipTextRow('b (s⁻¹)',cases.fit_b_s_inv), ...
+        dataTipTextRow('c (N·m·s/rad)',cases.fit_c_Nm_s_rad)];
+    ylim(ax,bLimits); ylabel(ax,'b (s⁻¹)');
+    if ~any(isfinite(cases.fit_b_s_inv))
+        text(ax,.5,.5,'No resolved swing fits','Units','normalized','HorizontalAlignment','center');
+    end
+    yyaxis(ax,'right');
+    ylim(ax,bLimits*cases.Ip_kg_m2(1)); ylabel(ax,'c (N·m·s/rad)');
+    yyaxis(ax,'left');
+    ax.YAxis(2).Color = ax.YAxis(1).Color;
+    title(ax,panelTitles{bolt});
+    xlim(ax,[49 71]); xticks(ax,50:5:70); xlabel(ax,'Travel distance (mm)'); grid(ax,'on');
+end
+distanceCaption = uilabel(distanceGrid,'Text', ...
+    'Each marker is one simulated fit. Read b on the left and c on the right. The scales are related by c = Iₚ b.');
+distanceCaption.Layout.Row = 2; distanceCaption.Layout.Column = [1 3];
 tableGrid = uigridlayout(tableTab,[1 1]);
-displayRuns = runs(:,{'file','bolt_count','distance_mm','cart_stop_s','fit_lambda_s_inv', ...
-    'fit_b_s_inv','fit_c_Nm_s_rad','free_peak_count','fit_note'});
+displayRuns = MS3_plotting_table(runs);
 uit = uitable(tableGrid,'Data',displayRuns,'Tag','runTable','RowName',{}, ...
     'ColumnEditable',false,'ColumnSortable',true);
-uit.ColumnName = {'Trace CSV','Bolts','Distance (mm)','Cart stop (s)','λ fit (s⁻¹)', ...
-    'b fit (s⁻¹)','c fit (N·m·s/rad)','Peaks','Fit details'};
-uit.ColumnWidth = {112,55,95,90,90,90,112,55,245};
+uit.ColumnName = displayRuns.Properties.VariableNames;
+uit.ColumnWidth = 'auto';
 footer = uigridlayout(page,[1 2]); footer.Padding = [0 0 0 0];
 footer.ColumnWidth = {128,'1x'};
 uibutton(footer,'Text','Open CSV folder','ButtonPushedFcn',@(~,~)winopen(char(runFolder)));
@@ -52,7 +82,6 @@ movegui(fig,'center'); fig.Visible = 'on';
         units = {'λ (s⁻¹)','b (s⁻¹)','c (N·m·s/rad)'};
         colours = [.15 .55 .85; .94 .52 .14; .37 .70 .39];
         markers = {'o','s','d'};
-        boltNames = {'1 centre','2 outer','3 all'};
         for j = 1:3
             ax = axesList(j);
             legend(ax,'off'); cla(ax); hold(ax,'on'); grid(ax,'on');
@@ -65,9 +94,9 @@ movegui(fig,'center'); fig.Visible = 'on';
                 else
                     x = distances;
                 end
-                pts = scatter(ax,x,values(rows),23, ...
+                pts = scatter(ax,x,values(rows),36, ...
                     'Marker',markers{b},'MarkerEdgeColor',colours(b,:), ...
-                    'DisplayName',boltNames{b});
+                    'MarkerFaceColor',colours(b,:),'DisplayName',boltNames{b});
                 if any(rows)
                     pts.DataTipTemplate.DataTipRows = [dataTipTextRow('Bolts',runs.bolt_count(rows)), ...
                         dataTipTextRow('Distance (mm)',distances),dataTipTextRow(units{j},values(rows))];
@@ -85,11 +114,7 @@ movegui(fig,'center'); fig.Visible = 'on';
             if isempty(usable)
                 text(ax,.5,.5,'No resolved swing fits','Units','normalized','HorizontalAlignment','center');
             else
-                % Include zero to avoid magnifying numerical fit scatter.
-                lo = min([0;usable]); hi = max([0;usable]);
-                pad = .08*(hi-lo);
-                if pad == 0, pad = 1e-6; end
-                ylim(ax,[lo-pad,hi+pad]);
+                ylim(ax,fitLimits(usable));
             end
         end
         if byBolt
@@ -98,4 +123,12 @@ movegui(fig,'center'); fig.Visible = 'on';
             caption.Text = 'Each marker is one simulated run. Fits can overlap because all runs use the same assumed rotational damping.';
         end
     end
+end
+
+function limits = fitLimits(values)
+values = [0;values(isfinite(values))];
+lo = min(values); hi = max(values);
+pad = .08*(hi-lo);
+if pad == 0, pad = 1e-6; end
+limits = [lo-pad,hi+pad];
 end

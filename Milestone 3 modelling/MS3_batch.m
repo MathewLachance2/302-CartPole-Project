@@ -49,6 +49,7 @@ try
         'free_peak_count','assumed_c_Nm_s_rad','model_b_s_inv','model_lambda_s_inv', ...
         'fit_lambda_s_inv','fit_b_s_inv','fit_c_Nm_s_rad','fit_note'});
     writetable(runs,fullfile(staging,'summary.csv'));
+    writetable(MS3_plotting_table(runs),fullfile(staging,'summary_plotting.csv'),'Encoding','UTF-8');
     [ok,msg] = movefile(staging,runFolder);
     if ~ok, error('MS3:BatchPublish','%s',msg); end
 catch issue
