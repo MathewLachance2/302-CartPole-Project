@@ -1,0 +1,4 @@
+pyserial
+numpy
+scipy>=1.15
+matplotlib

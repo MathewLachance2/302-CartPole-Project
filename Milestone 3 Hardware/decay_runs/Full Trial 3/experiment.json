@@ -1,0 +1,13 @@
+{
+  "run": {
+    "first_mm": 50,
+    "last_mm": 70,
+    "step_mm": 1,
+    "speed": 7000.0,
+    "acceleration": 100000.0,
+    "sample_ms": 10.0,
+    "free_s": 5.0,
+    "settle_s": 1.0
+  },
+  "direction": 1
+}

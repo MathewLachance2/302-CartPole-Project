@@ -1,0 +1,4 @@
+Distance-blocked rank permutation tests (21 matched distances)
+Up to 9,999 permutations. Bonferroni adjustment across b and c.
+b  rank statistic = 2.00, p = 0.000100, adjusted p = 0.000200 (evidence of a bolt-count difference)
+c  rank statistic = 0.222, p = 0.109, adjusted p = 0.218 (no significant difference)
